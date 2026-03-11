@@ -1,0 +1,24 @@
+# Large data directories
+our_code_data/data/
+shared_data/
+
+# Sanity-check generated datasets
+sanity_check/clean_labels/
+sanity_check/clean_labels_rows/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Slurm logs
+*.o*
+*.e*
+
+# Model artifacts and caches
+MIL/average_embed/*/cache/
+MIL/average_embed/*/*.npy
+MIL/average_embed/*/*.pt
+MIL/average_embed/*/*.pkl
+MIL/average_embed/*/*.log
+
+# Keep summary tables by default; ignore bulky per-run outputs not matched above
