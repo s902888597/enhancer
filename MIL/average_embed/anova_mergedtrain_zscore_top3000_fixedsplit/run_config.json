@@ -1,0 +1,19 @@
+{
+  "input_root": "/taiga/illinois/vetmed/cb/kwang222/enhancer/shared_data/BRCA_LUAD_SKCM_subset_MergedTrain_zscoreNorm_for_AI",
+  "output_root": "/taiga/illinois/vetmed/cb/kwang222/enhancer/MIL/average_embed/anova_mergedtrain_zscore_top3000_fixedsplit",
+  "selection": "top3000_by_one_way_welch_anova_F_statistic_from_merged_train",
+  "normalization": "merged_train_zscore_from_eRNA_then_average_per_SE",
+  "splits": "fixed train/validation/test from uploaded files",
+  "matrix_mask": "all ones",
+  "cancers": [
+    "BRCA",
+    "LUAD",
+    "SKCM"
+  ],
+  "n_targets": 3000,
+  "feature_links": {
+    "BRCA": 319,
+    "LUAD": 315,
+    "SKCM": 317
+  }
+}

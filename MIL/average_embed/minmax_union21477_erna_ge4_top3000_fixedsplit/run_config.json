@@ -1,0 +1,22 @@
+{
+  "input_root": "/taiga/illinois/vetmed/cb/kwang222/enhancer/shared_data/BRCA_LUAD_SKCM_SEs_union_eRNA_zscoreNorm_MinMaxNorm",
+  "output_root": "/taiga/illinois/vetmed/cb/kwang222/enhancer/MIL/average_embed/minmax_union21477_erna_ge4_top3000_fixedsplit",
+  "normalization": "minmax",
+  "selection": "filter_eRNA_count_ge4_then_top3000_by_variance_across_BRCA_LUAD_SKCM_train_minmax_only",
+  "splits": "fixed train/validation/test from uploaded minmax files",
+  "matrix_mask": "all ones",
+  "cancers": [
+    "BRCA",
+    "LUAD",
+    "SKCM"
+  ],
+  "min_eRNA_count": 4,
+  "n_targets": 3000,
+  "n_source_targets": 21477,
+  "n_after_eRNA_filter": 18557,
+  "feature_links": {
+    "BRCA": 319,
+    "LUAD": 315,
+    "SKCM": 317
+  }
+}

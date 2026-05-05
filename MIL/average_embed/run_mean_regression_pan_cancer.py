@@ -164,6 +164,16 @@ def build_identity_case_to_feature_dir(root: Path) -> Dict[str, Path]:
     return {p.name: p for p in sorted(root.iterdir()) if p.is_dir()}
 
 
+def build_normalized_identity_case_to_feature_dir(root: Path, sample_id_mode: str) -> Dict[str, Path]:
+    resolved: Dict[str, Path] = {}
+    for p in sorted(root.iterdir()):
+        if not p.is_dir():
+            continue
+        key = normalize_sample_id(p.name, sample_id_mode)
+        resolved.setdefault(key, p)
+    return resolved
+
+
 def read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
     # Try common encodings first.
     for enc in ("utf-8", "latin1", "utf-16"):
@@ -206,7 +216,7 @@ def read_csv_with_fallback(csv_path: Path) -> pd.DataFrame:
     return pd.DataFrame(data_rows, columns=header)
 
 
-def mean_embed_for_case_dir(case_dir: Path) -> np.ndarray:
+def pooled_embed_for_case_dir(case_dir: Path, pooling: str = "mean") -> np.ndarray:
     files = sorted(case_dir.glob("*.npy"))
     if not files:
         raise FileNotFoundError(f"No npy files in {case_dir}")
@@ -227,7 +237,12 @@ def mean_embed_for_case_dir(case_dir: Path) -> np.ndarray:
         )
     if not arrs:
         raise FileNotFoundError(f"All npy files are unreadable in {case_dir}")
-    return np.stack(arrs, axis=0).mean(axis=0)
+    stack = np.stack(arrs, axis=0)
+    if pooling == "mean":
+        return stack.mean(axis=0)
+    if pooling == "max":
+        return stack.max(axis=0)
+    raise ValueError(f"Unsupported pooling: {pooling}")
 
 
 def load_split_feats(
@@ -239,6 +254,7 @@ def load_split_feats(
     enh_ref: Optional[List[str]] = None,
     cache_dir: Optional[Path] = None,
     cancer: str = "",
+    pooling: str = "mean",
 ) -> Tuple[List[str], np.ndarray, np.ndarray, List[str]]:
     case_ids, label_df = load_label_df(csv_path, label_layout, sample_id_mode)
 
@@ -264,7 +280,7 @@ def load_split_feats(
     cache_ids = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        tag = f"{cancer}_{split_name}_{csv_path.stem}"
+        tag = f"{cancer}_{split_name}_{csv_path.stem}_{pooling}"
         cache_x = cache_dir / f"{tag}_X.npy"
         cache_ids = cache_dir / f"{tag}_ids.txt"
         if cache_x.exists() and cache_ids.exists():
@@ -280,7 +296,7 @@ def load_split_feats(
             else:
                 y = label_df.loc[kept_ids].values.astype(np.float32)
                 if x.shape[0] == y.shape[0]:
-                    print(f"[{split_name}] loaded mean feature cache: {cache_x}")
+                    print(f"[{split_name}] loaded {pooling} feature cache: {cache_x}")
                     return kept_ids, x, y, list(enh_cols)
                 print(
                     f"[{split_name}] cache shape mismatch X={x.shape} y={y.shape}, fallback recompute"
@@ -295,7 +311,7 @@ def load_split_feats(
             missing.append(cid)
             continue
         try:
-            emb = mean_embed_for_case_dir(case_dir)
+            emb = pooled_embed_for_case_dir(case_dir, pooling=pooling)
         except FileNotFoundError:
             missing.append(cid)
             continue
@@ -313,7 +329,7 @@ def load_split_feats(
     if cache_x is not None and cache_ids is not None:
         np.save(cache_x, x)
         cache_ids.write_text("\n".join(kept_ids) + ("\n" if kept_ids else ""))
-        print(f"[{split_name}] saved mean feature cache: {cache_x}")
+        print(f"[{split_name}] saved {pooling} feature cache: {cache_x}")
 
     return kept_ids, x, y, list(enh_cols)
 
@@ -402,6 +418,23 @@ def summarize_corr(corr_df: pd.DataFrame, split: str):
     )
 
 
+def maybe_eval_subset(
+    corr_df: pd.DataFrame,
+    subset_enhancers: Optional[set],
+    split: str,
+    out_dir: Path,
+    suffix: str,
+):
+    if not subset_enhancers:
+        return
+    sub_df = corr_df[corr_df["enhancer"].isin(subset_enhancers)].copy()
+    if sub_df.empty:
+        print(f"[warn] {split}_{suffix}: no enhancers matched subset")
+        return
+    summarize_corr(sub_df, f"{split}_{suffix}")
+    sub_df.to_csv(out_dir / f"per_enhancer_correlation_{split}_{suffix}.csv", index=False)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cancer", choices=["BRCA", "LUAD", "SKCM"], required=True)
@@ -422,6 +455,16 @@ def main():
     parser.add_argument("--seed", type=int, default=44)
     parser.add_argument("--pca-k", type=int, default=0, help="0 disables PCA; >0 applies PCA on labels fit on train only")
     parser.add_argument(
+        "--train-enhancers-file",
+        default="",
+        help="Optional file with one enhancer ID per line; if set, training/validation/test targets are restricted to this list.",
+    )
+    parser.add_argument(
+        "--subset-enhancers-file",
+        default="",
+        help="Optional file with one enhancer ID per line; if set, also report/save subset metrics.",
+    )
+    parser.add_argument(
         "--label-layout",
         choices=["samples_as_columns", "samples_as_rows"],
         default="samples_as_rows",
@@ -441,12 +484,29 @@ def main():
         default="",
         help="Optional cache dir for split-level mean features; speeds up repeated runs.",
     )
+    parser.add_argument("--pooling", choices=["mean", "max"], default="mean")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    subset_enhancers = None
+    if args.subset_enhancers_file:
+        subset_enhancers = {
+            s.strip()
+            for s in Path(args.subset_enhancers_file).read_text().splitlines()
+            if s.strip()
+        }
+        print(f"Loaded subset enhancers: {len(subset_enhancers)} from {args.subset_enhancers_file}")
+    train_enhancers = None
+    if args.train_enhancers_file:
+        train_enhancers = [
+            s.strip()
+            for s in Path(args.train_enhancers_file).read_text().splitlines()
+            if s.strip()
+        ]
+        print(f"Loaded train enhancer restriction: {len(train_enhancers)} from {args.train_enhancers_file}")
 
     cache_dir = Path(args.mean_cache_dir) if args.mean_cache_dir else None
     feat_root = Path(args.feat_root)
@@ -478,7 +538,16 @@ def main():
         enh_ref=None,
         cache_dir=cache_dir,
         cancer=args.cancer,
+        pooling=args.pooling,
     )
+    if train_enhancers is not None:
+        keep = [e for e in enh_cols if e in set(train_enhancers)]
+        if not keep:
+            raise RuntimeError("No overlap between train enhancers and loaded train labels")
+        idx = [enh_cols.index(e) for e in keep]
+        y_train = y_train[:, idx]
+        enh_cols = keep
+        print(f"Restricted training targets to shared enhancer subset: {len(enh_cols)}")
     val_ids, x_val, y_val, _ = load_split_feats(
         "validation",
         Path(args.val_csv),
@@ -488,6 +557,7 @@ def main():
         enh_ref=enh_cols,
         cache_dir=cache_dir,
         cancer=args.cancer,
+        pooling=args.pooling,
     )
     test_ids, x_test, y_test, _ = load_split_feats(
         "test",
@@ -498,6 +568,7 @@ def main():
         enh_ref=enh_cols,
         cache_dir=cache_dir,
         cancer=args.cancer,
+        pooling=args.pooling,
     )
 
     pca = None
@@ -557,6 +628,8 @@ def main():
     test_corr_df = pearson_per_feature(test_pred_orig, test_true_orig, enh_cols)
     summarize_corr(val_corr_df, "val")
     summarize_corr(test_corr_df, "test")
+    maybe_eval_subset(val_corr_df, subset_enhancers, "val", out_dir, "subset")
+    maybe_eval_subset(test_corr_df, subset_enhancers, "test", out_dir, "subset")
 
     torch.save(model.state_dict(), out_dir / "best_model.pt")
     np.save(out_dir / "train_ids.npy", np.array(train_ids))

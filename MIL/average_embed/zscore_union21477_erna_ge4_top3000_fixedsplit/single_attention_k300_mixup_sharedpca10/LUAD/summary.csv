@@ -1,0 +1,3 @@
+split,n_enhancers,pearson_mean,pearson_median,gt_0.4,gt_0.5,gt_0.6
+validation,10,0.29232279821373647,0.2673625523710221,2,1,1
+test,10,0.387233666000427,0.4121986527866749,5,2,0

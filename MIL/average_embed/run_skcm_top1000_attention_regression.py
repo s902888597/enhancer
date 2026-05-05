@@ -14,14 +14,19 @@ Pipeline:
 import argparse
 import copy
 from pathlib import Path
+import sys
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.decomposition import PCA
+from sklearn.decomposition import NMF, PCA
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+
+THIS_DIR = Path(__file__).resolve().parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
 
 from run_mean_regression import pearson_per_feature, set_seed
 
@@ -61,6 +66,11 @@ def load_labels_samples_as_columns(csv_path: Path) -> tuple[list[str], np.ndarra
 
 
 def load_labels(csv_path: Path, cancer: str) -> tuple[list[str], np.ndarray, list[str]]:
+    cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+    if "sample" in cols:
+        return load_labels_samples_as_rows(csv_path)
+    if "SE_ID" in cols:
+        return load_labels_samples_as_columns(csv_path)
     label_format = CANCER_LABEL_FORMAT[cancer]
     if label_format == "samples_as_rows":
         return load_labels_samples_as_rows(csv_path)
@@ -78,8 +88,11 @@ def build_case_to_feature_dir(root: Path) -> dict[str, Path]:
 def resolve_split_feature_root(feat_root: Path, split: str, cancer: str) -> Path:
     direct_root = feat_root / split
     cancer_root = feat_root / split / cancer
+    top_cancer_root = feat_root / cancer
     if cancer_root.exists():
         return cancer_root
+    if top_cancer_root.exists():
+        return top_cancer_root
     if direct_root.exists():
         return direct_root
     raise FileNotFoundError(f"No feature root found for split={split}, cancer={cancer} under {feat_root}")
@@ -180,8 +193,93 @@ def collate_batch(batch):
     return list(ids), tokens, valid, torch.stack(ys), list(patch_names)
 
 
+def sample_mixed_bag(
+    xa: torch.Tensor,
+    va: torch.Tensor,
+    xb: torch.Tensor,
+    vb: torch.Tensor,
+    lam: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    idx_a = torch.nonzero(va, as_tuple=False).flatten()
+    idx_b = torch.nonzero(vb, as_tuple=False).flatten()
+    if idx_a.numel() == 0 or idx_b.numel() == 0:
+        return xa, va
+
+    total_k = max(int(idx_a.numel()), int(idx_b.numel()))
+    want_a = int(round(lam * total_k))
+    want_a = min(max(want_a, 1), total_k - 1 if total_k > 1 else 1)
+    want_b = total_k - want_a
+    want_a = min(want_a, int(idx_a.numel()))
+    want_b = min(want_b, int(idx_b.numel()))
+
+    chosen_a = idx_a[torch.randperm(idx_a.numel(), device=xa.device)[:want_a]]
+    chosen_b = idx_b[torch.randperm(idx_b.numel(), device=xb.device)[:want_b]]
+    chosen = torch.cat([xa[chosen_a], xb[chosen_b]], dim=0)
+    if chosen.shape[0] < total_k:
+        rem_a = idx_a[torch.randperm(idx_a.numel(), device=xa.device)]
+        rem_b = idx_b[torch.randperm(idx_b.numel(), device=xb.device)]
+        remain = total_k - chosen.shape[0]
+        extra = []
+        if want_a < idx_a.numel():
+            extra.append(xa[rem_a[want_a:want_a + remain]])
+        if sum(t.shape[0] for t in extra) < remain and want_b < idx_b.numel():
+            need = remain - sum(t.shape[0] for t in extra)
+            extra.append(xb[rem_b[want_b:want_b + need]])
+        if extra:
+            chosen = torch.cat([chosen] + extra, dim=0)
+    chosen = chosen[:total_k]
+
+    mixed_x = torch.zeros_like(xa)
+    mixed_v = torch.zeros_like(va)
+    mixed_x[:chosen.shape[0]] = chosen
+    mixed_v[:chosen.shape[0]] = True
+    return mixed_x, mixed_v
+
+
+def apply_bag_mixup(
+    xb: torch.Tensor,
+    vb: torch.Tensor,
+    yb: torch.Tensor,
+    mixup_alpha: float,
+    mixup_prob: float,
+):
+    if mixup_alpha <= 0.0 or mixup_prob <= 0.0 or xb.shape[0] < 2:
+        return xb, vb, yb
+
+    perm = torch.randperm(xb.shape[0], device=xb.device)
+    use = torch.rand(xb.shape[0], device=xb.device) < mixup_prob
+    if not use.any():
+        return xb, vb, yb
+
+    beta = torch.distributions.Beta(mixup_alpha, mixup_alpha)
+    lam_all = beta.sample((xb.shape[0],)).to(device=xb.device, dtype=xb.dtype)
+
+    xb_out = xb.clone()
+    vb_out = vb.clone()
+    yb_out = yb.clone()
+    for i in torch.nonzero(use, as_tuple=False).flatten().tolist():
+        j = int(perm[i].item())
+        if j == i:
+            continue
+        lam = float(lam_all[i].item())
+        mixed_x, mixed_v = sample_mixed_bag(xb[i], vb[i], xb[j], vb[j], lam)
+        xb_out[i] = mixed_x
+        vb_out[i] = mixed_v
+        yb_out[i] = lam * yb[i] + (1.0 - lam) * yb[j]
+    return xb_out, vb_out, yb_out
+
+
 class AttentionPoolRegressor(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, embed_dim: int, attn_dim: int, hidden_dim: int, dropout: float):
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        embed_dim: int,
+        attn_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        positive_output: bool = False,
+    ):
         super().__init__()
         self.patch_embed = nn.Sequential(
             nn.Linear(input_dim, embed_dim),
@@ -191,17 +289,24 @@ class AttentionPoolRegressor(nn.Module):
         self.attention_v = nn.Linear(embed_dim, attn_dim)
         self.attention_u = nn.Linear(embed_dim, attn_dim)
         self.attention_w = nn.Linear(attn_dim, 1)
-        self.regressor = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, output_dim),
         )
+        self.positive_output = positive_output
+        self.softplus = nn.Softplus()
 
-    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor):
+    def encode(self, x: torch.Tensor, valid_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h_patch = self.patch_embed(x)
         a_v = torch.tanh(self.attention_v(h_patch))
         a_u = torch.sigmoid(self.attention_u(h_patch))
@@ -209,11 +314,59 @@ class AttentionPoolRegressor(nn.Module):
         scores = scores.masked_fill(~valid_mask, torch.finfo(scores.dtype).min)
         attn = torch.softmax(scores, dim=1)
         bag = torch.bmm(attn.unsqueeze(1), h_patch).squeeze(1)
-        pred = self.regressor(bag)
+        h = self.backbone(bag)
+        return h, attn
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor):
+        h, attn = self.encode(x, valid_mask)
+        pred = self.head(h)
+        if self.positive_output:
+            pred = self.softplus(pred)
         return pred, attn
 
 
-def train_epoch(model, loader, optim, loss_fn, device: torch.device) -> float:
+def load_pretrained_encoder(
+    model: AttentionPoolRegressor,
+    ckpt_path: Path,
+    cancer: str,
+    load_cancer_head: bool,
+) -> tuple[list[str], list[str]]:
+    state = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        raise RuntimeError(f"Unexpected checkpoint format in {ckpt_path}")
+
+    own = model.state_dict()
+    loaded: list[str] = []
+    skipped: list[str] = []
+
+    prefixes = ["patch_embed", "attention_v", "attention_u", "attention_w", "backbone"]
+    for key, value in state.items():
+        if any(key.startswith(prefix) for prefix in prefixes):
+            if key in own and own[key].shape == value.shape:
+                own[key] = value
+                loaded.append(key)
+            else:
+                skipped.append(key)
+
+    if load_cancer_head:
+        src_prefix = f"heads.{cancer}."
+        for key, value in state.items():
+            if not key.startswith(src_prefix):
+                continue
+            mapped = "head." + key[len(src_prefix):]
+            if mapped in own and own[mapped].shape == value.shape:
+                own[mapped] = value
+                loaded.append(f"{key}->{mapped}")
+            else:
+                skipped.append(f"{key}->{mapped}")
+
+    model.load_state_dict(own)
+    return loaded, skipped
+
+
+def train_epoch(model, loader, optim, loss_fn, device: torch.device, mixup_alpha: float, mixup_prob: float) -> float:
     model.train()
     total = 0.0
     n = 0
@@ -221,6 +374,7 @@ def train_epoch(model, loader, optim, loss_fn, device: torch.device) -> float:
         xb = xb.to(device)
         vb = vb.to(device)
         yb = yb.to(device)
+        xb, vb, yb = apply_bag_mixup(xb, vb, yb, mixup_alpha, mixup_prob)
         optim.zero_grad(set_to_none=True)
         pred, _ = model(xb, vb)
         loss = loss_fn(pred, yb)
@@ -319,6 +473,15 @@ def predicted_pc_metric_row(split: str, corr_df: pd.DataFrame) -> dict:
     }
 
 
+def latent_corr_filename(split_name: str, reducer_name: str) -> str:
+    base = "predicted_pc_correlation" if reducer_name == "pca" else f"predicted_{reducer_name}_correlation"
+    return f"{base}_{split_name}.csv"
+
+
+def latent_summary_filename(reducer_name: str) -> str:
+    return "predicted_pc_summary.csv" if reducer_name == "pca" else f"predicted_{reducer_name}_summary.csv"
+
+
 def infer_input_dim(feat_root: Path, cancer: str) -> int:
     for split in ["train", "validation", "test"]:
         split_root = resolve_split_feature_root(feat_root, split, cancer)
@@ -347,6 +510,12 @@ def main():
     parser.add_argument("--max-patches-train", type=int, default=0)
     parser.add_argument("--max-patches-eval", type=int, default=0)
     parser.add_argument("--pca-k", type=int, default=0, help="If >0, fit PCA on y_train and predict in PC space.")
+    parser.add_argument("--nmf-k", type=int, default=0, help="If >0, fit NMF on y_train and predict in latent space.")
+    parser.add_argument("--nmf-max-iter", type=int, default=1000)
+    parser.add_argument("--mixup-alpha", type=float, default=0.0)
+    parser.add_argument("--mixup-prob", type=float, default=0.0)
+    parser.add_argument("--pretrained-ckpt", default="", help="Optional mixed-model checkpoint to initialize shared encoder/backbone.")
+    parser.add_argument("--load-pretrained-cancer-head", action="store_true", help="Also initialize from the matching cancer-specific head when available.")
     parser.add_argument("--seed", type=int, default=44)
     parser.add_argument("--early-patience", type=int, default=5)
     parser.add_argument("--min-delta", type=float, default=0.0)
@@ -372,6 +541,10 @@ def main():
         "test": test_ds.y.cpu().numpy().astype(np.float32),
     }
     pca = None
+    nmf = None
+    reducer_name = "direct"
+    if args.pca_k > 0 and args.nmf_k > 0:
+        raise RuntimeError("Use only one reducer: --pca-k or --nmf-k, not both.")
     if args.pca_k > 0:
         if args.pca_k >= len(enh_cols):
             raise RuntimeError(f"--pca-k must be smaller than output dim ({len(enh_cols)}), got {args.pca_k}")
@@ -386,6 +559,36 @@ def main():
             f"EVR_sum={float(pca.explained_variance_ratio_.sum()):.6f}",
             flush=True,
         )
+        reducer_name = "pca"
+    elif args.nmf_k > 0:
+        if args.nmf_k >= len(enh_cols):
+            raise RuntimeError(f"--nmf-k must be smaller than output dim ({len(enh_cols)}), got {args.nmf_k}")
+        if float(y["train"].min()) < -1e-8:
+            raise RuntimeError("NMF requires non-negative train labels.")
+        y_nmf = {
+            "train": y["train"],
+            "validation": np.clip(y["validation"], 0.0, None).astype(np.float32),
+            "test": np.clip(y["test"], 0.0, None).astype(np.float32),
+        }
+        nmf = NMF(
+            n_components=args.nmf_k,
+            init="nndsvda",
+            random_state=args.seed,
+            max_iter=args.nmf_max_iter,
+            solver="cd",
+            beta_loss="frobenius",
+        )
+        y_fit = {
+            "train": nmf.fit_transform(y_nmf["train"]).astype(np.float32),
+            "validation": nmf.transform(y_nmf["validation"]).astype(np.float32),
+            "test": nmf.transform(y_nmf["test"]).astype(np.float32),
+        }
+        print(
+            f"{args.cancer}: y-NMF enabled: k={args.nmf_k}, "
+            f"reconstruction_err={float(nmf.reconstruction_err_):.6f}, n_iter={int(nmf.n_iter_)}",
+            flush=True,
+        )
+        reducer_name = "nmf"
     else:
         y_fit = {split: y[split].astype(np.float32) for split in ["train", "validation", "test"]}
         print(f"{args.cancer}: y-PCA disabled; predicting {len(enh_cols)} targets directly", flush=True)
@@ -413,7 +616,22 @@ def main():
         attn_dim=args.attn_dim,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
+        positive_output=(nmf is not None),
     ).to(device)
+    if args.pretrained_ckpt:
+        loaded, skipped = load_pretrained_encoder(
+            model,
+            Path(args.pretrained_ckpt),
+            args.cancer,
+            args.load_pretrained_cancer_head,
+        )
+        print(
+            f"{args.cancer}: loaded pretrained checkpoint {args.pretrained_ckpt} "
+            f"(loaded={len(loaded)}, skipped={len(skipped)})",
+            flush=True,
+        )
+        if skipped:
+            print(f"{args.cancer}: pretrained skipped keys e.g. {skipped[:10]}", flush=True)
     loss_fn = nn.MSELoss()
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -422,7 +640,7 @@ def main():
     bad_epochs = 0
     history = []
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optim, loss_fn, device)
+        train_loss = train_epoch(model, train_loader, optim, loss_fn, device, args.mixup_alpha, args.mixup_prob)
         val_loss, _, _, _, _, _ = eval_epoch(model, val_loader, loss_fn, device)
         if val_loss < (best_val - args.min_delta):
             best_val = val_loss
@@ -450,6 +668,9 @@ def main():
     if pca is not None:
         val_pred = pca.inverse_transform(val_pred_raw).astype(np.float32)
         test_pred = pca.inverse_transform(test_pred_raw).astype(np.float32)
+    elif nmf is not None:
+        val_pred = nmf.inverse_transform(np.maximum(val_pred_raw, 0.0)).astype(np.float32)
+        test_pred = nmf.inverse_transform(np.maximum(test_pred_raw, 0.0)).astype(np.float32)
     else:
         val_pred = val_pred_raw.astype(np.float32)
         test_pred = test_pred_raw.astype(np.float32)
@@ -483,23 +704,41 @@ def main():
     np.save(out_dir / "y_train.npy", y["train"])
     np.save(out_dir / "y_validation.npy", y["validation"])
     np.save(out_dir / "y_test.npy", y["test"])
-    np.save(out_dir / "y_pca_train.npy", y_fit["train"])
-    np.save(out_dir / "y_pca_validation.npy", y_fit["validation"])
-    np.save(out_dir / "y_pca_test.npy", y_fit["test"])
+    if pca is not None:
+        np.save(out_dir / "y_pca_train.npy", y_fit["train"])
+        np.save(out_dir / "y_pca_validation.npy", y_fit["validation"])
+        np.save(out_dir / "y_pca_test.npy", y_fit["test"])
+    elif nmf is not None:
+        np.save(out_dir / "y_nmf_train.npy", y_fit["train"])
+        np.save(out_dir / "y_nmf_validation.npy", y_fit["validation"])
+        np.save(out_dir / "y_nmf_test.npy", y_fit["test"])
     if pca is not None:
         np.save(out_dir / "pca_components.npy", pca.components_.astype(np.float32))
         np.save(out_dir / "pca_mean.npy", pca.mean_.astype(np.float32))
         np.save(out_dir / "pca_explained_variance_ratio.npy", pca.explained_variance_ratio_.astype(np.float32))
         val_pc_corr = per_pc_prediction_corr(val_pred_raw, val_true_raw)
         test_pc_corr = per_pc_prediction_corr(test_pred_raw, test_true_raw)
-        val_pc_corr.to_csv(out_dir / "predicted_pc_correlation_validation.csv", index=False)
-        test_pc_corr.to_csv(out_dir / "predicted_pc_correlation_test.csv", index=False)
+        val_pc_corr.to_csv(out_dir / latent_corr_filename("validation", reducer_name), index=False)
+        test_pc_corr.to_csv(out_dir / latent_corr_filename("test", reducer_name), index=False)
         pd.DataFrame(
             [
                 predicted_pc_metric_row("validation", val_pc_corr),
                 predicted_pc_metric_row("test", test_pc_corr),
             ]
-        ).to_csv(out_dir / "predicted_pc_summary.csv", index=False)
+        ).to_csv(out_dir / latent_summary_filename(reducer_name), index=False)
+    elif nmf is not None:
+        np.save(out_dir / "nmf_components.npy", nmf.components_.astype(np.float32))
+        np.save(out_dir / "nmf_reconstruction_err.npy", np.array([nmf.reconstruction_err_], dtype=np.float32))
+        val_nmf_corr = per_pc_prediction_corr(val_pred_raw, val_true_raw)
+        test_nmf_corr = per_pc_prediction_corr(test_pred_raw, test_true_raw)
+        val_nmf_corr.to_csv(out_dir / latent_corr_filename("validation", reducer_name), index=False)
+        test_nmf_corr.to_csv(out_dir / latent_corr_filename("test", reducer_name), index=False)
+        pd.DataFrame(
+            [
+                predicted_pc_metric_row("validation", val_nmf_corr),
+                predicted_pc_metric_row("test", test_nmf_corr),
+            ]
+        ).to_csv(out_dir / latent_summary_filename(reducer_name), index=False)
 
     np.save(out_dir / "val_attention_weights.npy", np.array(val_attn, dtype=object), allow_pickle=True)
     np.save(out_dir / "test_attention_weights.npy", np.array(test_attn, dtype=object), allow_pickle=True)
@@ -507,6 +746,40 @@ def main():
     np.save(out_dir / "test_patch_names.npy", np.array(test_patch_names, dtype=object), allow_pickle=True)
     save_attention_tables(out_dir / "val_patch_attention", val_ids, val_patch_names, val_attn)
     save_attention_tables(out_dir / "test_patch_attention", test_ids, test_patch_names, test_attn)
+
+    pd.Series(
+        {
+            "cancer": args.cancer,
+            "reducer": reducer_name,
+            "pca_k": args.pca_k,
+            "nmf_k": args.nmf_k,
+            "nmf_max_iter": args.nmf_max_iter,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "embed_dim": args.embed_dim,
+            "attn_dim": args.attn_dim,
+            "hidden_dim": args.hidden_dim,
+            "dropout": args.dropout,
+            "max_patches_train": args.max_patches_train,
+            "max_patches_eval": args.max_patches_eval,
+            "mixup_alpha": args.mixup_alpha,
+            "mixup_prob": args.mixup_prob,
+            "pretrained_ckpt": args.pretrained_ckpt,
+            "load_pretrained_cancer_head": bool(args.load_pretrained_cancer_head),
+            "seed": args.seed,
+            "early_patience": args.early_patience,
+            "min_delta": args.min_delta,
+            "device": str(device),
+            "n_train": int(y["train"].shape[0]),
+            "n_validation": int(y["validation"].shape[0]),
+            "n_test": int(y["test"].shape[0]),
+            "n_outputs": int(len(enh_cols)),
+            "n_reduced_outputs": int(y_fit["train"].shape[1]),
+        }
+    ).to_json(out_dir / "run_config.json")
 
     print(f"Saved outputs to {out_dir}")
 
